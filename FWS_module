@@ -1,0 +1,425 @@
+Option Compare Database
+
+
+
+Sub importFWS()
+    Dim db As DAO.Database
+    Dim xlApp As New Excel.Application
+    Dim wb As Workbook
+    Dim ws As Worksheet
+    Dim filePath As String
+    Dim arrRange As Range
+    Dim lastrow As Long
+    Dim firstrow As Long
+    Dim firstcol As Long
+    Dim lastcol As Long
+
+    On Error GoTo importError ' Error handler for unexpected errors
+
+    Set db = CurrentDb
+
+    ' Prompt user to select an Excel file
+    With Application.FileDialog(3)
+        .Title = "Select Excel File"
+        .Filters.Clear
+        .Filters.Add "Excel Files", "*.xls; *.xlsx; *.xlsm"
+        .AllowMultiSelect = False
+        If .Show <> -1 Then
+            MsgBox "No file selected. Exiting."
+            GoTo cleanup
+        End If
+        filePath = .SelectedItems(1)
+    End With
+
+    ' Start Excel application
+    xlApp.Visible = True   'set to true to debug
+
+    ' Open the selected workbook
+    Set wb = xlApp.Workbooks.Open(filePath, ReadOnly:=True)
+
+    ' Reference the specific worksheet, isolate the error
+    On Error Resume Next
+    Set ws = wb.Worksheets("HRSDetail")
+    On Error GoTo importError
+
+    If ws Is Nothing Then
+        MsgBox "Worksheet 'HRSDetail' not found."
+        GoTo cleanup
+    End If
+
+   
+   'this import takes some time to run - give user feedback via simple form:
+    DoCmd.OpenForm "frmStatus", , , , , acWindowNormal
+        DoCmd.SelectObject acForm, "frmStatus" 'form not showing - this is to restore focus to access if behind xl
+        DoCmd.Restore
+        With Forms("frmStatus")
+            .Visible = True
+            .SetFocus
+        '    Debug.Print Forms(0).Name & " " & Forms(1).Visible
+        End With
+
+        
+    Forms("frmStatus").Controls("lblStatus").Caption = "Cleaning up worksheet..."
+    DoEvents
+    cleanUpWorksheet ws
+    DoEvents
+     ' Wait to ensure workbook is ready workaround. The ungrouping takes a while causing a race condition
+    'xlApp.Wait Now + TimeValue("0:00:05")
+    Dim t As Double
+    t = 2
+    Do While Timer < t + 1
+        DoEvents
+    Loop
+
+    
+
+    ' Define range from C16:Z(last row)
+    firstrow = 16
+    firstcol = 3
+    lastcol = 26
+    lastrow = ws.Cells(ws.Rows.Count, firstcol).End(xlUp).Row
+    
+    Forms("frmStatus").Controls("lblStatus").Caption = "Building Array..."
+    DoEvents
+    Set arrRange = ws.Range(ws.Cells(firstrow, firstcol), ws.Cells(lastrow, lastcol))
+    'debug.Print "Range is: " & arrRange.Address
+     Forms("frmStatus").Controls("lblStatus").Caption = "Building Array..."
+    DoEvents
+   rangeToArr arrRange, xlApp
+    Forms("frmStatus").Controls("lblStatus").Caption = "Appending Records to table..."
+    DoEvents
+    arrayToTable rangeToArr(arrRange, xlApp)
+    'MsgBox ("done")
+cleanup:
+    On Error Resume Next
+    Forms("frmStatus").Controls("lblStatus").Caption = "HR Detail Import Complete"
+    Forms("frmStatus").Controls("cmdCloseCounterForm").Enabled = True
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    If Not xlApp Is Nothing Then xlApp.Quit
+    Set ws = Nothing
+    Set wb = Nothing
+    Set xlApp = Nothing
+    Set db = Nothing
+    refreshData
+    AppActivate "Microsoft Access"  'added when troublshooting form corruption.  leaving as it does not seem to hurt
+    DoEvents
+    Exit Sub
+
+importError:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbExclamation
+    Resume cleanup
+    AppActivate "Microsoft Access"   'added when troublshooting form corruption.  leaving as it does not seem to hurt
+    DoEvents
+End Sub
+
+
+
+Sub cleanUpWorksheet(ws As Object)
+
+    ' Remove subtotals
+    On Error Resume Next
+    ws.Cells.RemoveSubtotal
+    On Error GoTo 0
+
+    ' Ungroup all (rows and columns)
+    On Error Resume Next
+    ws.Rows.Ungroup
+    ws.Columns.Ungroup
+    On Error GoTo 0
+
+    ' Show all rows and columns
+    ws.Rows.Hidden = False
+    ws.Columns.Hidden = False
+
+    
+End Sub
+
+Function rangeToArr(ByRef r As Range, a As Excel.Application) As Variant
+    Dim rowcount As Long, colcount As Long
+    rowcount = r.Rows.Count
+    colcount = 5
+    
+    Dim myArr() As Variant
+    ReDim myArr(1 To rowcount, 1 To colcount)
+    
+    Dim tmpTotal As Double
+    Dim currID As String, nextID As String
+    Dim currName As String, currAcct As String, currProj As String
+    Dim currAmt As Double
+    
+    Dim i As Long, j As Long
+    j = 1
+    
+    For i = 1 To rowcount
+        currID = Trim(CStr(r.Cells(i, 24).Value))
+        If currID = "" Then GoTo SkipRow
+        
+        currName = r.Cells(i, 3)
+        currAcct = r.Cells(i, 1)
+        currProj = r.Cells(i, 19)
+        currAmt = CDbl(r.Cells(i, 12).Value)
+        tmpTotal = tmpTotal + currAmt
+        
+        ' Look ahead to next *non-blank* row for ID
+        nextID = ""
+        Dim nextAcct As String 'trying to fix the summing over id not acct prob
+        nextAcct = ""
+        Dim lookAhead As Long
+        For lookAhead = i + 1 To rowcount
+            nextID = Trim(CStr(r.Cells(lookAhead, 24).Value))
+            nextAcct = Trim(CStr(r.Cells(lookAhead, 1).Value))
+            If nextID <> "" Then Exit For
+        Next lookAhead
+        
+        'If currID <> nextID Then   'problem here if only one ID.   eg 01944676 g7b70235
+        If currID <> nextID Or currAcct <> nextAcct Then   'check for change of acct as well as id
+            myArr(j, 1) = currID
+            myArr(j, 2) = currName
+            myArr(j, 3) = tmpTotal
+            myArr(j, 4) = currAcct
+            myArr(j, 5) = currProj
+            j = j + 1
+            tmpTotal = 0
+        End If
+
+SkipRow:
+    Forms("frmStatus").Controls("txtCounter").Value = i
+    Next i
+
+    ' Trim array
+    Dim retArray() As Variant
+    ReDim retArray(1 To j - 1, 1 To 5)
+    
+    Dim k As Long, m As Long
+    For k = 1 To j - 1
+        For m = 1 To 5
+            retArray(k, m) = myArr(k, m)
+        Next m
+    Next k
+
+    rangeToArr = retArray
+End Function
+
+
+Sub arrayToTable(ByRef r As Variant)
+
+    Dim db As DAO.Database
+    Set db = CurrentDb
+    
+    Dim rs As DAO.Recordset
+    
+
+    
+    Set rs = db.OpenRecordset("WS_HR", dbOpenDynaset)
+    
+    ' delete existing records before adding new
+    Dim response As String
+    response = MsgBox("Delete all records from WS_HR table? (choose 'no' to append instead", vbQuestion + vbYesNo, "Import HR Detail")
+    If response = vbYes Then
+        Dim strSql As String
+        strSql = "delete from " & rs.Name
+        db.Execute strSql, dbFailOnError
+    End If
+    
+    Dim i As Long
+    For i = 1 To UBound(r, 1)
+        rs.AddNew
+            rs.Fields(0).Value = r(i, 1)
+            rs.Fields(1).Value = r(i, 2)
+            rs.Fields(2).Value = r(i, 3)
+            rs.Fields(3).Value = r(i, 4)
+            rs.Fields(4).Value = r(i, 5)
+        rs.update
+        Forms("frmStatus").Controls("txtCounter").Value = i ' "added row " & i & " to table"
+        'Debug.Print "added row " & i; " to table1"
+    Next i
+    rs.Close
+    Set rs = Nothing
+    Set db = Nothing
+End Sub
+
+
+Sub import_WS_PS()
+  Dim db As DAO.Database
+  Set db = CurrentDb
+  Dim rs As DAO.Recordset
+  
+ 
+  
+  
+  
+  'Dim rs As DAO.Recordset
+  'Set rs = db.OpenRecordset("WS_PS", dbOpenDynaset)
+  Dim filePath As String
+  
+      With Application.FileDialog(3)
+        .Title = "Select Excel File"
+        .Filters.Clear
+        .Filters.Add "Excel Files", "*.xls; *.xlsx; *.xlsm"
+        .AllowMultiSelect = False
+        If .Show <> -1 Then
+            MsgBox "No file selected. Exiting."
+            GoTo cleanup
+        End If
+        filePath = .SelectedItems(1)
+    End With
+  'drop existing data and reimport selected
+   db.Execute "Delete from WS_PS", dbFailOnError
+   
+  DoCmd.TransferSpreadsheet _
+    TransferType:=acImport, _
+    SpreadsheetType:=acSpreadsheetTypeExcel12Xml, _
+    TableName:="WS_PS", _
+    filename:=filePath, _
+    HasFieldNames:=True
+
+  
+cleanup:
+  Set db = Nothing
+  Set rs = Nothing
+  refreshData
+  MsgBox ("import complete")
+End Sub
+
+
+Function getSelectedAccounts() As String
+    
+    Dim varItem As Variant
+    Dim strList As String
+
+    With [Forms]![FWS Recon Util]![lstAccts]
+        For Each varItem In .ItemsSelected
+            strList = strList & "'" & .ItemData(varItem) & "',"
+        Next varItem
+    End With
+
+    ' Remove the trailing comma
+    If Len(strList) > 0 Then
+        strList = Left(strList, Len(strList) - 1)
+    End If
+
+    getSelectedAccounts = strList
+    'Debug.Print strList
+
+End Function
+
+Sub updateSubform(sf As Form)
+    Dim q As String   'requery the COMP subform.   sName,  emplID, HR_Sum, PS_Sum
+
+
+'q = "SELECT MISMATCHED_SUMS.sName, MISMATCHED_SUMS.EmplID, MISMATCHED_SUMS.HR_Sum, MISMATCHED_SUMS.PS_Sum " & _
+"FROM MISMATCHED_SUMS " & _
+"WHERE (((MISMATCHED_SUMS.Acct) in (" & getSelectedAccounts() & "))) ORDER BY MISMATCHED_SUMS.sName;"
+    
+ q = "SELECT MISMATCHED_SUMS.sName, MISMATCHED_SUMS.EmplID, SUM(MISMATCHED_SUMS.HR_Sum) as HR_Sum, SUM(MISMATCHED_SUMS.PS_Sum) as PS_Sum " & _
+"FROM MISMATCHED_SUMS " & _
+"WHERE (((MISMATCHED_SUMS.Acct) in (" & getSelectedAccounts() & "))) " & _
+" Group BY sName, EmplID" & _
+" ORDER BY MISMATCHED_SUMS.sName;"
+'Debug.Print q
+Debug.Print "updateSubform "
+    sf.RecordSource = q
+    sf.Requery
+    
+    Dim sqlString As String
+    sqlString = " SELECT Sum(MISMATCHED_SUMS.PS_Sum) AS PS_Sum_Discrepency, Sum(MISMATCHED_SUMS.HR_Sum) AS HR_Sum_Discrepency, (Sum(MISMATCHED_SUMS.PS_Sum)  -  Sum(MISMATCHED_SUMS.HR_Sum) ) AS Difference " & _
+    "FROM MISMATCHED_SUMS " & _
+    "WHERE (((MISMATCHED_SUMS.Acct)IN (" & getSelectedAccounts & ")))"
+    
+   ' Debug.Print sqlString
+    updateRecSums (sqlString)
+End Sub
+
+Sub refreshData()
+'refresh after reimporting HR or PS data
+Forms("FWS Recon Util")!lstRecSums.Requery
+updateSubform [Forms]![FWS Recon Util]![HR_PS_COMP subform].Form
+
+
+End Sub
+
+Sub updateRecSums(q As String)
+Debug.Print q
+    With Forms("FWS Recon Util")!lstRecSums
+        .RowSource = q
+        .Requery
+    End With
+    'FormslstRecSums.RowSource = sqlString
+End Sub
+
+Function getDrillURL(currentId As String) As String
+    Dim strSql As String
+    Dim rs As DAO.Recordset
+    On Error GoTo error_handler
+    'https://sa.niu.edu/psp/ps_newwin/EMPLOYEE/SA/c/NIU_FINANCIAL_AID.NIU_STDNT_WRKSTUDY.GBL?Page=NIU_STDNT_WRKSTUDY&Action=U&EMPLID=01843093
+
+   ' strSql = "SELECT TOP 1 [Drilling URL] FROM WS_PS WHERE ID = '" & currentID & "'"
+    strSql = "https://sa.niu.edu/psp/ps_newwin/EMPLOYEE/SA/c/NIU_FINANCIAL_AID.NIU_STDNT_WRKSTUDY.GBL?Page=NIU_STDNT_WRKSTUDY&Action=U&" & _
+    "EMPLID=" & currentId & _
+    "&AID_YEAR=2025"
+
+ '   Set rs = CurrentDb.OpenRecordset(strSql, dbOpenSnapshot)'
+ '   If Not rs.EOF Then
+'
+'        getDrillURL = Nz(rs("Drilling URL"), "")
+'    Else
+'        getDrillURL = ""
+'    End If'
+'
+'    rs.Close
+'    Set rs = Nothing
+    getDrillURL = strSql
+    Exit Function   ' <-- prevents fall-through to error handler
+
+error_handler:
+    MsgBox "Error " & Err.Number & ": " & Err.Description, vbExclamation, "getDrillURL"
+    getDrillURL = "" ' ensure function returns a string even on error
+End Function
+
+
+ Sub cleanUpandClose()
+    On Error Resume Next ' Quick and dirty error handling
+
+    ' Close all open forms (except this one)
+    Dim o As AccessObject
+    Set o = Forms("FWS Recon Util")
+    Dim frm As AccessObject
+    For Each frm In CurrentProject.AllForms
+        If frm.IsLoaded And frm.Name <> o.Name Then
+            DoCmd.Close acForm, frm.Name
+        End If
+    Next frm
+
+    ' Close reports
+    Dim rpt As AccessObject
+    For Each rpt In CurrentProject.AllReports
+        If rpt.IsLoaded Then
+            DoCmd.Close acReport, rpt.Name
+        End If
+    Next rpt
+
+    ' Close any known global recordsets (example)
+    If Not rsMain Is Nothing Then
+        If rsMain.State = 1 Then rsMain.Close
+        Set rsMain = Nothing
+    End If
+
+    ' Optional: Close the app entirely
+     Application.Quit acQuitSaveAll
+End Sub
+
+Sub updateIssues(currID As String)
+On Error GoTo Error
+
+Dim strSql As String
+strSql = "Select * FROM ISSUES WHERE EMPLID = '" & currID & "'and FIXED <> TRUE;"
+Dim frm As Form
+Set frm = Forms("FWS Recon Util").Controls("subformIssues").Form
+frm.RecordSource = strSql
+frm.Requery
+
+    Exit Sub
+Error:
+    MsgBox (Err)
+End Sub
+
